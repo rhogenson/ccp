@@ -1,10 +1,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13,6 +13,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"gitlab.com/rhogenson/ccp/internal/cp"
+	"gitlab.com/rhogenson/ccp/internal/wfs/osfs"
+	"gitlab.com/rhogenson/ccp/internal/wfs/sftpfs"
 	"gitlab.com/rhogenson/deque"
 )
 
@@ -27,23 +29,25 @@ type model struct {
 	progress progress.Model
 	msgs     chan tea.Msg
 
-	srcs []string
-	dst  string
+	srcs []cp.FSPath
+	dst  cp.FSPath
 
 	max          int64
 	current      atomic.Int64
 	measurements deque.Deque[measurement]
-	copyingFiles map[string]bool
+	copyingFiles map[string]string
 	copyingFile  string
 	errs         []string
 }
 
 type (
-	tickMsg struct{}
+	tickMsg time.Time
 
 	maxMsg       int64
-	fileStartMsg string
-	fileDoneMsg  struct {
+	fileStartMsg struct {
+		from, to string
+	}
+	fileDoneMsg struct {
 		name string
 		err  error
 	}
@@ -57,13 +61,13 @@ func (m *model) listen() tea.Cmd {
 }
 
 func tick() tea.Cmd {
-	return tea.Tick(10*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+	return tea.Tick(10*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m *model) Init() tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg {
-			cp.Copy(m.srcs, m.dst, *f, m)
+			cp.Copy(m, m.srcs, m.dst, *f)
 			return doneMsg{}
 		},
 		m.listen(),
@@ -76,10 +80,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.max = int64(msg)
 		return m, m.listen()
 	case fileStartMsg:
-		name := string(msg)
-		m.copyingFiles[name] = true
+		m.copyingFiles[msg.from] = msg.to
 		if m.copyingFile == "" {
-			m.copyingFile = name
+			m.copyingFile = msg.from
 		}
 		return m, m.listen()
 	case fileDoneMsg:
@@ -102,12 +105,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			tea.Quit)
 
 	case tickMsg:
-		now := time.Now()
-		for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
-			m.measurements.PopFront()
-		}
 		n := m.current.Load()
-		m.measurements.PushBack(measurement{now, n})
+		now := time.Time(msg)
+		if m.measurements.Len() == 0 || now.Sub(m.measurements.At(m.measurements.Len()-1).t) > 500*time.Millisecond {
+			for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
+				m.measurements.PopFront()
+			}
+			m.measurements.PushBack(measurement{now, n})
+		}
 		cmds := []tea.Cmd{tick()}
 		if m.max > 0 {
 			cmds = append(cmds, m.progress.SetPercent(float64(n)/float64(m.max)))
@@ -132,7 +137,7 @@ var warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
 func (m *model) View() string {
 	copying := ""
 	if m.copyingFile != "" {
-		copying = "Copying " + m.copyingFile + "..."
+		copying = m.copyingFile + " -> " + m.copyingFiles[m.copyingFile]
 	}
 	etaStr := "calculating..."
 	if m.max > 0 && m.measurements.Len() > 1 {
@@ -159,12 +164,72 @@ func (m *model) Progress(n int64) {
 	m.current.Add(n)
 }
 
-func (m *model) FileStart(name string) {
-	m.msgs <- fileStartMsg(name)
+func (m *model) FileStart(from, to string) {
+	m.msgs <- fileStartMsg{from, to}
 }
 
 func (m *model) FileDone(name string, err error) {
 	m.msgs <- fileDoneMsg{name, err}
+}
+
+func splitHostPath(target string) (string, string) {
+	i := strings.IndexAny(target, ":/")
+	if i < 0 || target[i] == '/' {
+		return "", target
+	}
+	return target[:i], target[i+1:]
+}
+
+func run() error {
+	args := flag.Args()
+	if len(args) < 2 {
+		return errors.New("usage error")
+	}
+	srcTargets, dstTarget := args[:len(args)-1], args[len(args)-1]
+	sftpHosts := make(map[string]*sftpfs.FS)
+	for _, tgt := range append(srcTargets, dstTarget) {
+		host, _ := splitHostPath(tgt)
+		if host == "" || sftpHosts[host] != nil {
+			continue
+		}
+		fs, err := sftpfs.Dial(host)
+		if err != nil {
+			return err
+		}
+		defer fs.Close()
+		sftpHosts[host] = fs
+	}
+	srcs := make([]cp.FSPath, len(srcTargets))
+	for i, tgt := range srcTargets {
+		host, path := splitHostPath(tgt)
+		if host == "" {
+			srcs[i] = cp.FSPath{FS: osfs.FS{}, Path: path}
+		} else {
+			srcs[i] = cp.FSPath{FS: sftpHosts[host], Path: path}
+		}
+	}
+	dstHost, dstPath := splitHostPath(dstTarget)
+	var dst cp.FSPath
+	if dstHost == "" {
+		dst = cp.FSPath{FS: osfs.FS{}, Path: dstPath}
+	} else {
+		dst = cp.FSPath{FS: sftpHosts[dstHost], Path: dstPath}
+	}
+	m := &model{
+		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
+		msgs:         make(chan tea.Msg),
+		copyingFiles: make(map[string]string),
+
+		srcs: srcs,
+		dst:  dst,
+	}
+	if _, err := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr)).Run(); err != nil {
+		return err
+	}
+	if len(m.errs) > 0 {
+		return errors.New("exiting with one or more errors")
+	}
+	return nil
 }
 
 func main() {
@@ -179,30 +244,8 @@ Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.
 	}
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage error")
-		os.Exit(2)
-	}
-	srcs, dst := args[:len(args)-1], args[len(args)-1]
-	if len(srcs) == 1 {
-		if stat, err := os.Stat(dst); err == nil && stat.IsDir() {
-			dst = filepath.Join(dst, filepath.Base(srcs[0]))
-		}
-	}
-	m := &model{
-		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
-		msgs:         make(chan tea.Msg),
-		copyingFiles: make(map[string]bool),
-
-		srcs: srcs,
-		dst:  dst,
-	}
-	if _, err := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr)).Run(); err != nil {
+	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	if len(m.errs) > 0 {
 		os.Exit(1)
 	}
 }
