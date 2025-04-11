@@ -27,10 +27,6 @@ type measurement struct {
 
 type model struct {
 	progress progress.Model
-	msgs     chan tea.Msg
-
-	srcs []cp.FSPath
-	dst  cp.FSPath
 
 	max          int64
 	current      atomic.Int64
@@ -38,6 +34,7 @@ type model struct {
 	copyingFiles map[string]string
 	copyingFile  string
 	errs         []string
+	done         bool
 }
 
 type (
@@ -54,37 +51,23 @@ type (
 	doneMsg struct{}
 )
 
-func (m *model) listen() tea.Cmd {
-	return func() tea.Msg {
-		return <-m.msgs
-	}
-}
-
 func tick() tea.Cmd {
 	return tea.Tick(10*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(
-		func() tea.Msg {
-			cp.Copy(m, m.srcs, m.dst, *f)
-			return doneMsg{}
-		},
-		m.listen(),
-		tick())
+	return tick()
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case maxMsg:
 		m.max = int64(msg)
-		return m, m.listen()
 	case fileStartMsg:
 		m.copyingFiles[msg.from] = msg.to
 		if m.copyingFile == "" {
 			m.copyingFile = msg.from
 		}
-		return m, m.listen()
 	case fileDoneMsg:
 		delete(m.copyingFiles, msg.name)
 		if m.copyingFile == msg.name {
@@ -97,12 +80,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.errs = append(m.errs, msg.err.Error())
 		}
-		return m, m.listen()
 	case doneMsg:
-		return m, tea.Sequence(
-			m.progress.SetPercent(float64(m.current.Load())/float64(m.max)),
-			tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return nil }),
-			tea.Quit)
+		m.done = true
+		var cmd tea.Cmd
+		if m.max > 0 {
+			cmd = m.progress.SetPercent(float64(m.current.Load()) / float64(m.max))
+		}
+		if !m.progress.IsAnimating() {
+			return m, tea.Quit
+		}
+		return m, cmd
 
 	case tickMsg:
 		n := m.current.Load()
@@ -119,17 +106,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
-	case tea.WindowSizeMsg:
-		m.progress.Width = msg.Width - 4
-		return m, nil
 	// FrameMsg is sent when the progress bar wants to animate itself
 	case progress.FrameMsg:
 		progressModel, cmd := m.progress.Update(msg)
 		m.progress = progressModel.(progress.Model)
+		if m.done && !m.progress.IsAnimating() {
+			return m, tea.Quit
+		}
 		return m, cmd
-	default:
-		return m, nil
+	case tea.WindowSizeMsg:
+		m.progress.Width = msg.Width - 4
 	}
+	return m, nil
 }
 
 var warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
@@ -142,11 +130,11 @@ func (m *model) View() string {
 	etaStr := "calculating..."
 	if m.max > 0 && m.measurements.Len() > 1 {
 		first := m.measurements.At(0)
-		last := m.measurements.At(m.measurements.Len() - 1)
-		deltaT := last.t.Sub(first.t)
-		delta := last.i - first.i
+		current := m.current.Load()
+		deltaT := time.Since(first.t)
+		delta := current - first.i
 		if delta != 0 {
-			etaStr = time.Duration(float64(m.max-last.i) / float64(delta) * float64(deltaT)).Round(time.Second).String()
+			etaStr = time.Duration(float64(m.max-current) / float64(delta) * float64(deltaT)).Round(time.Second).String()
 		}
 	}
 	return "\n" +
@@ -156,20 +144,25 @@ func (m *model) View() string {
 		warningStyle(strings.Join(m.errs, "\n")) + "\n"
 }
 
-func (m *model) Max(n int64) {
-	m.msgs <- maxMsg(n)
+type progressUpdater struct {
+	p       *tea.Program
+	current *atomic.Int64
 }
 
-func (m *model) Progress(n int64) {
-	m.current.Add(n)
+func (pu *progressUpdater) Max(n int64) {
+	pu.p.Send(maxMsg(n))
 }
 
-func (m *model) FileStart(from, to string) {
-	m.msgs <- fileStartMsg{from, to}
+func (pu *progressUpdater) Progress(n int64) {
+	pu.current.Add(n)
 }
 
-func (m *model) FileDone(name string, err error) {
-	m.msgs <- fileDoneMsg{name, err}
+func (pu *progressUpdater) FileStart(from, to string) {
+	pu.p.Send(fileStartMsg{from, to})
+}
+
+func (pu *progressUpdater) FileDone(name string, err error) {
+	pu.p.Send(fileDoneMsg{name, err})
 }
 
 func splitHostPath(target string) (string, string) {
@@ -217,13 +210,14 @@ func run() error {
 	}
 	m := &model{
 		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
-		msgs:         make(chan tea.Msg),
 		copyingFiles: make(map[string]string),
-
-		srcs: srcs,
-		dst:  dst,
 	}
-	if _, err := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr)).Run(); err != nil {
+	p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr))
+	go func() {
+		cp.Copy(&progressUpdater{p, &m.current}, srcs, dst, *f)
+		p.Send(doneMsg{})
+	}()
+	if _, err := p.Run(); err != nil {
 		return err
 	}
 	if len(m.errs) > 0 {

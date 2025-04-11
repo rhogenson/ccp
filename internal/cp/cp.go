@@ -6,7 +6,8 @@ import (
 	"io"
 	"io/fs"
 	"path"
-	"sync"
+	"slices"
+	"strings"
 
 	"gitlab.com/rhogenson/ccp/internal/wfs"
 	"gitlab.com/rhogenson/ccp/internal/wfs/sftpfs"
@@ -31,10 +32,54 @@ func (p FSPath) String() string {
 	return p.Path
 }
 
+func (p FSPath) WalkDir(fn fs.WalkDirFunc) error {
+	return fs.WalkDir(p.FS, p.Path, fn)
+}
+
+func (p FSPath) Stat() (fs.FileInfo, error) {
+	return fs.Stat(p.FS, p.Path)
+}
+
+func (p FSPath) Lstat() (fs.FileInfo, error) {
+	return wfs.Lstat(p.FS, p.Path)
+}
+
+func (p FSPath) RemoveAll() error {
+	return wfs.RemoveAll(p.FS, p.Path)
+}
+
+func (p FSPath) Open() (fs.File, error) {
+	return p.FS.Open(p.Path)
+}
+
+func (p FSPath) Create(mode fs.FileMode) (io.WriteCloser, error) {
+	return p.FS.Create(p.Path, mode)
+}
+
+func (p FSPath) ReadLink() (string, error) {
+	return wfs.ReadLink(p.FS, p.Path)
+}
+
+func (p FSPath) SymlinkFrom(target string) error {
+	return p.FS.Symlink(target, p.Path)
+}
+
+func (p FSPath) Mkdir() error {
+	return p.FS.Mkdir(p.Path)
+}
+
+func (p FSPath) MkdirMode(mode fs.FileMode) error {
+	return wfs.MkdirMode(p.FS, p.Path, mode)
+}
+
+func (p FSPath) Chmod(mode fs.FileMode) error {
+	return p.FS.Chmod(p.Path, mode)
+}
+
 func size(srcs []FSPath) int64 {
 	var n int64 = 0
 	for _, src := range srcs {
-		fs.WalkDir(src.FS, src.Path, func(_ string, d fs.DirEntry, err error) error {
+		src.WalkDir(func(_ string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
 			}
@@ -54,31 +99,21 @@ func size(srcs []FSPath) int64 {
 	return n
 }
 
-func fileExists(path FSPath) bool {
-	_, err := wfs.Lstat(path.FS, path.Path)
+func (p FSPath) exists() bool {
+	_, err := p.Lstat()
 	return !errors.Is(err, fs.ErrNotExist)
 }
 
 type copier struct {
-	p   Progress
-	sem chan struct{}
-
+	p     Progress
 	force bool
 }
 
-func (c *copier) g(fn func()) {
-	c.sem <- struct{}{}
-	go func() {
-		defer func() { <-c.sem }()
-		fn()
-	}()
-}
-
 func (c *copier) openWithRetry(path FSPath, fn func() error) error {
-	if err := fn(); err == nil || !c.force || !fileExists(path) {
+	if err := fn(); err == nil || !c.force || !path.exists() {
 		return err
 	}
-	if err := wfs.RemoveAll(path.FS, path.Path); err != nil {
+	if err := path.RemoveAll(); err != nil {
 		return err
 	}
 	return fn()
@@ -87,7 +122,7 @@ func (c *copier) openWithRetry(path FSPath, fn func() error) error {
 func (c *copier) copyRegularFile(src, dst FSPath) error {
 	c.p.FileStart(src.String(), dst.String())
 
-	in, err := src.FS.Open(src.Path)
+	in, err := src.Open()
 	if err != nil {
 		return err
 	}
@@ -99,7 +134,7 @@ func (c *copier) copyRegularFile(src, dst FSPath) error {
 	var out io.WriteCloser
 	if err := c.openWithRetry(dst, func() error {
 		var err error
-		out, err = dst.FS.Create(dst.Path, stat.Mode().Perm())
+		out, err = dst.Create(stat.Mode().Perm())
 		return err
 	}); err != nil {
 		return err
@@ -125,83 +160,31 @@ func (c *copier) copyRegularFile(src, dst FSPath) error {
 	return nil
 }
 
-func (c *copier) copySymlink(src FSPath, d fs.DirEntry, dst FSPath) error {
-	target, err := wfs.ReadLink(src.FS, src.Path)
+func (c *copier) copySymlink(src FSPath, dst FSPath) error {
+	target, err := src.ReadLink()
 	if err != nil {
 		return err
 	}
 	if err := c.openWithRetry(dst, func() error {
-		return dst.FS.Symlink(target, dst.Path)
+		return dst.SymlinkFrom(target)
 	}); err != nil {
 		return err
 	}
 	c.p.Progress(1)
 	return nil
-}
-
-func (c *copier) copyDir(src FSPath, d fs.DirEntry, dst FSPath) error {
-	stat, err := d.Info()
-	if err != nil {
-		return err
-	}
-	hasWritePerm := stat.Mode()&0300 == 0300
-	if err := c.openWithRetry(dst, func() error {
-		if hasWritePerm {
-			return wfs.MkdirMode(dst.FS, dst.Path, stat.Mode().Perm())
-		} else {
-			return dst.FS.Mkdir(dst.Path)
-		}
-	}); err != nil {
-		return err
-	}
-	entries, err := fs.ReadDir(src.FS, src.Path)
-	wg := new(sync.WaitGroup)
-	<-c.sem
-	for _, entry := range entries {
-		wg.Add(1)
-		c.g(func() {
-			defer wg.Done()
-			src := FSPath{src.FS, path.Join(src.Path, entry.Name())}
-			if err := c.copyFile(src, entry, FSPath{dst.FS, path.Join(dst.Path, entry.Name())}); err != nil {
-				c.p.FileDone(src.String(), err)
-			}
-		})
-	}
-	wg.Wait()
-	c.sem <- struct{}{}
-	if err != nil {
-		return err
-	}
-	if !hasWritePerm {
-		if err := dst.FS.Chmod(dst.Path, stat.Mode().Perm()); err != nil {
-			return err
-		}
-	}
-	c.p.Progress(1)
-	return nil
-}
-
-func (c *copier) copyFile(src FSPath, d fs.DirEntry, dst FSPath) error {
-	switch d.Type() {
-	case 0: // regular file
-		return c.copyRegularFile(src, dst)
-	case fs.ModeDir:
-		return c.copyDir(src, d, dst)
-	case fs.ModeSymlink:
-		return c.copySymlink(src, d, dst)
-	default:
-		return fmt.Errorf("%s: unknown file type %s", src, d.Type())
-	}
 }
 
 func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		progress.Max(size(srcs))
 	}()
+	defer func() { <-done }()
 
 	dstIsDir := true
 	if len(srcs) == 1 {
-		stat, err := fs.Stat(dstRoot.FS, dstRoot.Path)
+		stat, err := dstRoot.Stat()
 		dstIsDir = err == nil && stat.IsDir()
 	}
 
@@ -210,28 +193,75 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 	sem := make(chan struct{}, maxConcurrency)
 	c := &copier{
 		p:     progress,
-		sem:   sem,
 		force: force,
 	}
-	wg := new(sync.WaitGroup)
+	type roDir struct {
+		path FSPath
+		mode fs.FileMode
+	}
+	var roDirs []roDir
 	for _, srcRoot := range srcs {
-		wg.Add(1)
-		c.g(func() {
-			defer wg.Done()
-			dstRoot := dstRoot
-			if dstIsDir {
-				dstRoot.Path = path.Join(dstRoot.Path, path.Base(srcRoot.Path))
-			}
-			stat, err := fs.Stat(srcRoot.FS, srcRoot.Path)
+		dstRoot := dstRoot
+		if dstIsDir {
+			dstRoot.Path = path.Join(dstRoot.Path, path.Base(srcRoot.Path))
+		}
+		srcRoot.Path = path.Clean(srcRoot.Path)
+		srcRoot.WalkDir(func(srcPath string, d fs.DirEntry, err error) error {
+			src := FSPath{srcRoot.FS, srcPath}
+			dst := FSPath{dstRoot.FS, path.Join(dstRoot.Path, strings.TrimPrefix(srcPath, srcRoot.Path))}
 			if err != nil {
-				progress.FileDone(srcRoot.String(), err)
-				return
+				progress.FileDone(src.String(), err)
+				return nil
 			}
-			if err := c.copyFile(srcRoot, fs.FileInfoToDirEntry(stat), dstRoot); err != nil {
-				progress.FileDone(srcRoot.String(), err)
-				return
+			switch d.Type() {
+			case 0:
+				sem <- struct{}{}
+				go func() {
+					defer func() { <-sem }()
+					if err := c.copyRegularFile(src, dst); err != nil {
+						progress.FileDone(src.String(), err)
+					}
+				}()
+			case fs.ModeDir:
+				stat, err := d.Info()
+				if err != nil {
+					progress.FileDone(src.String(), err)
+					return nil
+				}
+				hasWritePerm := stat.Mode()&0300 == 0300
+				if err := c.openWithRetry(dst, func() error {
+					if hasWritePerm {
+						return dst.MkdirMode(stat.Mode().Perm())
+					} else {
+						return dst.Mkdir()
+					}
+				}); err != nil {
+					progress.FileDone(src.String(), err)
+					return nil
+				}
+				if hasWritePerm {
+					progress.Progress(1)
+				} else {
+					roDirs = append(roDirs, roDir{dst, stat.Mode().Perm()})
+				}
+			case fs.ModeSymlink:
+				if err := c.copySymlink(src, dst); err != nil {
+					progress.FileDone(src.String(), err)
+				}
+			default:
+				progress.FileDone(src.String(), fmt.Errorf("%s: unknown file type %s", src, d.Type()))
 			}
+			return nil
 		})
 	}
-	wg.Wait()
+	for range maxConcurrency {
+		sem <- struct{}{}
+	}
+	for _, d := range slices.Backward(roDirs) {
+		if err := d.path.Chmod(d.mode); err != nil {
+			progress.FileDone(d.path.String(), err)
+			continue
+		}
+		progress.Progress(1)
+	}
 }
