@@ -52,7 +52,7 @@ type (
 )
 
 func tick() tea.Cmd {
-	return tea.Tick(10*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m *model) Init() tea.Cmd {
@@ -94,12 +94,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		n := m.current.Load()
 		now := time.Time(msg)
-		if m.measurements.Len() == 0 || now.Sub(m.measurements.At(m.measurements.Len()-1).t) > 500*time.Millisecond {
-			for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
-				m.measurements.PopFront()
-			}
-			m.measurements.PushBack(measurement{now, n})
+		for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
+			m.measurements.PopFront()
 		}
+		m.measurements.PushBack(measurement{now, n})
 		cmds := []tea.Cmd{tick()}
 		if m.max > 0 {
 			cmds = append(cmds, m.progress.SetPercent(float64(n)/float64(m.max)))
@@ -130,11 +128,11 @@ func (m *model) View() string {
 	etaStr := "calculating..."
 	if m.max > 0 && m.measurements.Len() > 1 {
 		first := m.measurements.At(0)
-		current := m.current.Load()
-		deltaT := time.Since(first.t)
-		delta := current - first.i
+		last := m.measurements.At(m.measurements.Len() - 1)
+		deltaT := last.t.Sub(first.t)
+		delta := last.i - first.i
 		if delta != 0 {
-			etaStr = time.Duration(float64(m.max-current) / float64(delta) * float64(deltaT)).Round(time.Second).String()
+			etaStr = time.Duration(float64(m.max-last.i) / float64(delta) * float64(deltaT)).Round(time.Second).String()
 		}
 	}
 	return "\n" +
