@@ -173,6 +173,17 @@ func splitHostPath(target string) (string, string) {
 	return target[:i], target[i+1:]
 }
 
+func toFSPath(target string, sftpHosts map[string]*sftpfs.FS) cp.FSPath {
+	host, path := splitHostPath(target)
+	if host == "" {
+		return cp.FSPath{FS: osfs.FS{}, Path: path}
+	}
+	if path == "" {
+		path = "."
+	}
+	return cp.FSPath{FS: sftpHosts[host], Path: path}
+}
+
 func run() error {
 	args := flag.Args()
 	if len(args) < 2 {
@@ -194,20 +205,9 @@ func run() error {
 	}
 	srcs := make([]cp.FSPath, len(srcTargets))
 	for i, tgt := range srcTargets {
-		host, path := splitHostPath(tgt)
-		if host == "" {
-			srcs[i] = cp.FSPath{FS: osfs.FS{}, Path: path}
-		} else {
-			srcs[i] = cp.FSPath{FS: sftpHosts[host], Path: path}
-		}
+		srcs[i] = toFSPath(tgt, sftpHosts)
 	}
-	dstHost, dstPath := splitHostPath(dstTarget)
-	var dst cp.FSPath
-	if dstHost == "" {
-		dst = cp.FSPath{FS: osfs.FS{}, Path: dstPath}
-	} else {
-		dst = cp.FSPath{FS: sftpHosts[dstHost], Path: dstPath}
-	}
+	dst := toFSPath(dstTarget, sftpHosts)
 	m := &model{
 		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		copyingFiles: make(map[string]string),

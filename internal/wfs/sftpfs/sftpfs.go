@@ -180,8 +180,16 @@ func (f *FS) Close() error {
 	return sftpErr
 }
 
+func (f *FS) err(op, path string, err error) error {
+	return fmt.Errorf("%s %q: %w", op, f.User+"@"+f.Host+":"+path, err)
+}
+
 func (f *FS) Open(name string) (fs.File, error) {
-	return f.conn.Open(name)
+	file, err := f.conn.Open(name)
+	if err != nil {
+		return nil, f.err("open", name, err)
+	}
+	return file, nil
 }
 
 func (f *FS) ReadDir(name string) ([]fs.DirEntry, error) {
@@ -190,45 +198,72 @@ func (f *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	for i, entry := range entriesFileInfo {
 		entries[i] = fs.FileInfoToDirEntry(entry)
 	}
+	if err != nil {
+		return entries, f.err("readdir", name, err)
+	}
 	return entries, err
 }
 
 func (f *FS) Stat(name string) (fs.FileInfo, error) {
-	return f.conn.Stat(name)
+	fi, err := f.conn.Stat(name)
+	if err != nil {
+		return nil, f.err("stat", name, err)
+	}
+	return fi, nil
 }
 
 func (f *FS) Lstat(name string) (fs.FileInfo, error) {
-	return f.conn.Lstat(name)
+	fi, err := f.conn.Lstat(name)
+	if err != nil {
+		return nil, f.err("lstat", name, err)
+	}
+	return fi, nil
 }
 
 func (f *FS) ReadLink(name string) (string, error) {
-	return f.conn.ReadLink(name)
+	target, err := f.conn.ReadLink(name)
+	if err != nil {
+		return "", f.err("readlink", name, err)
+	}
+	return target, nil
 }
 
 func (f *FS) Create(name string, perm fs.FileMode) (io.WriteCloser, error) {
 	file, err := f.conn.Create(name)
 	if err != nil {
-		return nil, err
+		return nil, f.err("open", name, err)
 	}
 	if err := file.Chmod(perm); err != nil {
 		file.Close()
-		return nil, err
+		return nil, f.err("chmod", name, err)
 	}
 	return file, nil
 }
 
 func (f *FS) Remove(name string) error {
-	return f.conn.Remove(name)
+	if err := f.conn.Remove(name); err != nil {
+		return f.err("remove", name, err)
+	}
+	return nil
 }
 
 func (f *FS) Mkdir(name string) error {
-	return f.conn.Mkdir(name)
+	if err := f.conn.Mkdir(name); err != nil {
+		return f.err("mkdir", name, err)
+	}
+	return nil
 }
 
 func (f *FS) Symlink(oldname, newname string) error {
-	return f.conn.Symlink(oldname, newname)
+	if err := f.conn.Symlink(oldname, newname); err != nil {
+		return f.err("symlink", newname, err)
+	}
+	return nil
 }
 
 func (f *FS) Chmod(name string, mode fs.FileMode) error {
-	return f.conn.Chmod(name, mode)
+	if err := f.conn.Chmod(name, mode); err != nil {
+		return f.err("chmod", name, err)
+	}
+	return nil
 }
