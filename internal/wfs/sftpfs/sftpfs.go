@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -120,7 +119,7 @@ func sshKeys() ([]ssh.Signer, error) {
 }
 
 func appendToKnownHosts(hostname string, key ssh.PublicKey) error {
-	f, err := os.OpenFile(path.Join(os.Getenv("HOME"), ".ssh/known_hosts"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	f, err := os.OpenFile(filepath.Join(os.Getenv("HOME"), ".ssh/known_hosts"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
@@ -133,7 +132,7 @@ func appendToKnownHosts(hostname string, key ssh.PublicKey) error {
 
 // Dial establishes a new SFTP connection to the given host.
 func Dial(target string) (*FS, error) {
-	knownHostChecker, err := knownhosts.New(path.Join(os.Getenv("HOME"), ".ssh/known_hosts"))
+	knownHostChecker, err := knownhosts.New(filepath.Join(os.Getenv("HOME"), ".ssh/known_hosts"))
 	if err != nil {
 		knownHostChecker = func(string, net.Addr, ssh.PublicKey) error { return &knownhosts.KeyError{} }
 	}
