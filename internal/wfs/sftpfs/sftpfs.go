@@ -1,3 +1,4 @@
+// Package sftpfs implements [wfs.FS] using [github.com/pkg/sftp].
 package sftpfs
 
 import (
@@ -24,10 +25,11 @@ var (
 	_ wfs.FS         = (*FS)(nil)
 	_ wfs.ReadLinkFS = (*FS)(nil)
 	_ fs.StatFS      = (*FS)(nil)
-	_ fs.StatFS      = (*FS)(nil)
 	_ fs.ReadDirFS   = (*FS)(nil)
 )
 
+// An FS holds an SFTP connection and wraps its operations into the
+// [wfs.FS] interface.
 type FS struct {
 	User, Host string
 	conn       *sftp.Client
@@ -46,6 +48,14 @@ var sshAgent = sync.OnceValue(func() agent.ExtendedAgent {
 	return agent.NewClient(conn)
 })
 
+// sshKeys returns the available ssh public keys. If an ssh agent can be
+// contacted with $SSH_AUTH_SOCK, sshKeys uses the keys from the agent if
+// possible. Otherwise sshKeys loads keys from ~/.ssh. If there are any password
+// protected keys, sshKeys may prompt the user for the password (although it
+// will do so at most once).
+//
+// If a password-protected key is loaded from ~/.ssh, it will be added to the
+// ssh agent if possible.
 func sshKeys() ([]ssh.Signer, error) {
 	sshAgent := sshAgent()
 	if sshAgent != nil {
@@ -121,6 +131,7 @@ func appendToKnownHosts(hostname string, key ssh.PublicKey) error {
 	return f.Close()
 }
 
+// Dial establishes a new SFTP connection to the given host.
 func Dial(target string) (*FS, error) {
 	knownHostChecker, err := knownhosts.New(path.Join(os.Getenv("HOME"), ".ssh/known_hosts"))
 	if err != nil {
@@ -152,6 +163,9 @@ func Dial(target string) (*FS, error) {
 			if !errors.As(err, &keyErr) || len(keyErr.Want) > 0 {
 				return err
 			}
+			// scp prompts the user if the host is not found in
+			// known_hosts, but when is that ever useful? We'll just
+			// add it to known_hosts without bothering the user.
 			appendToKnownHosts(hostname, key)
 			return nil
 		},
@@ -172,6 +186,7 @@ func Dial(target string) (*FS, error) {
 	}, nil
 }
 
+// Close closes the underlying SFTP connection.
 func (f *FS) Close() error {
 	sftpErr := f.conn.Close()
 	if err := f.sshConn.Close(); err != nil {
@@ -181,8 +196,12 @@ func (f *FS) Close() error {
 }
 
 func (f *FS) err(op, path string, err error) error {
+	// github.com/pkg/sftp's errors are pretty terrible.
+	// We'll wrap them to be more similar to the amazing package os errors.
 	return fmt.Errorf("%s %q: %w", op, f.User+"@"+f.Host+":"+path, err)
 }
+
+// wfs.FS implementation:
 
 func (f *FS) Open(name string) (fs.File, error) {
 	file, err := f.conn.Open(name)

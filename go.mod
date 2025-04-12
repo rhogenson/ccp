@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/pkg/sftp v1.13.9
-	gitlab.com/rhogenson/deque v0.0.0-20250406161547-43e0f85d8030
+	gitlab.com/rhogenson/deque v1.0.0
 	golang.org/x/crypto v0.37.0
 	golang.org/x/term v0.31.0
 )

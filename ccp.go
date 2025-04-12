@@ -1,3 +1,32 @@
+// The ccp ("cute copy") command copies files and directories while showing a
+// colorful progress bar. It supports SFTP remote file copies similar to scp.
+//
+// The architecture is a mix of classical goroutines and the bubbletea-style
+// "Elm architecture". Trying to do a recursive concurrent file copy using the
+// Elm architecture would make Update a massive bottleneck, so that part is
+// performed in a background goroutine that periodically sends updates to the
+// main program using the [cp.Progress] interface.
+//
+// The Elm architecture doesn't seem to fit well with Go's concurrency model in
+// my opinion. You even have articles like
+// https://charm.sh/blog/commands-in-bubbletea/ saying that you should "never"
+// use goroutines in a Bubble Tea program, which IMO is just absurd and throwing
+// out one of the best parts of Go. Ideally a UI library would leverage the
+// strengths of Go's concurrency model instead of trying to force some
+// architecture from a different language. For example, [tea.Tick] is
+// inconvenient because the user has to remember to call Tick again inside
+// Update, otherwise it only runs once. Instead it could have just leveraged the
+// standard library [time.Ticker] with
+//
+//	go func() {
+//	    for t := range time.NewTicker(time.Second).C {
+//	        program.Send(tickMsg(t))
+//	    }
+//	}()
+//
+// It's too limiting that a [tea.Cmd] can only return a single [tea.Msg].
+// Instead, in the true spirit of Go's CSP model, a tea.Cmd should be able to
+// send multiple messages on a channel. Thanks for reading my rant.
 package main
 
 import (
@@ -28,31 +57,55 @@ type measurement struct {
 type model struct {
 	progress progress.Model
 
-	max          int64
-	current      atomic.Int64
+	// max is the total bytes (plus fudge factor) to copy.
+	max int64
+	// current holds the current number of copied bytes.
+	current atomic.Int64
+	// Every 500 milliseconds, the current progress is appended to
+	// measurements for calculating ETA.
 	measurements deque.Deque[measurement]
+	// copyingFiles holds the files currently being copied. Keys are source
+	// paths and values are the corresponding destination paths.
 	copyingFiles map[string]string
-	copyingFile  string
-	errs         []string
-	done         bool
+	// copyingFile is an arbitrary entry from copyingFiles that we're
+	// currently showing to the user. Tracked in the state so that it
+	// doesn't change every time we update the view.
+	copyingFile string
+	// eta is the estimated time to completion, or -1 if we don't have
+	// enough samples.
+	eta time.Duration
+	// errs are the errors encountered during operation.
+	errs []string
+	// done indicates whether the copy is done and we're just waiting for
+	// the progress bar to finish animating.
+	done bool
 }
 
 type (
+	// tickMsg is sent every 500 milliseconds.
 	tickMsg time.Time
 
-	maxMsg       int64
+	// maxMsg sets the total bytes to copy. This message is only sent once
+	// during the program lifetime after we asynchronously calculate the
+	// number of bytes to copy.
+	maxMsg int64
+	// fileStartMsg is sent whenever we start copying a file.
 	fileStartMsg struct {
 		from, to string
 	}
+	// fileDoneMsg is sent whenever we finish copying a file. err indicates
+	// any error that was encountered during the copy.
 	fileDoneMsg struct {
 		name string
 		err  error
 	}
+	// doneMsg is sent when all files are finished copying and it's time
+	// to exit.
 	doneMsg struct{}
 )
 
 func tick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func (m *model) Init() tea.Cmd {
@@ -94,10 +147,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		n := m.current.Load()
 		now := time.Time(msg)
-		for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
-			m.measurements.PopFront()
+
+		if m.measurements.Len() == 0 || now.Sub(m.measurements.At(m.measurements.Len()-1).t) > 500*time.Millisecond {
+			for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
+				m.measurements.PopFront()
+			}
+			m.measurements.PushBack(measurement{now, n})
+
+			if m.max > 0 {
+				first := m.measurements.At(0)
+				if delta := n - first.i; delta != 0 {
+					deltaT := now.Sub(first.t)
+					m.eta = time.Duration(float64(m.max-n) / float64(delta) * float64(deltaT))
+				}
+			}
 		}
-		m.measurements.PushBack(measurement{now, n})
+
 		cmds := []tea.Cmd{tick()}
 		if m.max > 0 {
 			cmds = append(cmds, m.progress.SetPercent(float64(n)/float64(m.max)))
@@ -126,14 +191,8 @@ func (m *model) View() string {
 		copying = m.copyingFile + " -> " + m.copyingFiles[m.copyingFile]
 	}
 	etaStr := "calculating..."
-	if m.max > 0 && m.measurements.Len() > 1 {
-		first := m.measurements.At(0)
-		last := m.measurements.At(m.measurements.Len() - 1)
-		deltaT := last.t.Sub(first.t)
-		delta := last.i - first.i
-		if delta != 0 {
-			etaStr = time.Duration(float64(m.max-last.i) / float64(delta) * float64(deltaT)).Round(time.Second).String()
-		}
+	if m.eta >= 0 {
+		etaStr = m.eta.Round(time.Second).String()
 	}
 	return "\n" +
 		"  " + copying + "\n" +
@@ -142,6 +201,7 @@ func (m *model) View() string {
 		warningStyle(strings.Join(m.errs, "\n")) + "\n"
 }
 
+// progressUpdater implements the cp.Progress interface.
 type progressUpdater struct {
 	p       *tea.Program
 	current *atomic.Int64
@@ -163,6 +223,9 @@ func (pu *progressUpdater) FileDone(name string, err error) {
 	pu.p.Send(fileDoneMsg{name, err})
 }
 
+// splitHostPath splits an scp target into host and path, e.g. user@host:/path/
+// If the user wants to copy a local file that has a colon in it, they can
+// qualify it with the directory name, e.g. ./file:with:colons.
 func splitHostPath(target string) (string, string) {
 	i := strings.IndexAny(target, ":/")
 	if i < 0 || target[i] == '/' {
@@ -209,10 +272,11 @@ func run() error {
 	m := &model{
 		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		copyingFiles: make(map[string]string),
+		eta:          -1,
 	}
 	p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr))
 	go func() {
-		cp.Copy(&progressUpdater{p, &m.current}, srcs, dst, *f)
+		cp.Copy(&progressUpdater{p, &m.current}, srcs, dst, *f) // Where the magic happens
 		p.Send(doneMsg{})
 	}()
 	if _, err := p.Run(); err != nil {
@@ -226,10 +290,19 @@ func run() error {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: ccp [OPTION]... SOURCE DEST
-  or:  ccp [OPTION]... SOURCE... DIRECTORY
+		fmt.Fprintf(os.Stderr, `Usage: ccp [OPTION]... SOURCE TARGET
+  or:  ccp [OPTION]... SOURCE... TARGET
 
-Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.
+Copy SOURCE to TARGET, or multiple SOURCE(s) to a directory TARGET.
+Uses SFTP for remote file copies.
+
+ccp will ask for passwords or passphrases if they are needed
+for authentication.
+
+The source and target may be specified as a local pathname or a remote
+host with optional path in the form [user@]host:[path]. Local file names
+can be made explicit using absolute or relative pathnames to avoid ccp
+treating file names containing `+"`"+`:' as host specifiers.
 
 `)
 		flag.PrintDefaults()

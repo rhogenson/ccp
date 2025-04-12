@@ -1,3 +1,4 @@
+// Package osfs implements [wfs.FS] backed by the local filesystem.
 package osfs
 
 import (
@@ -15,6 +16,7 @@ var (
 	_ fs.StatFS       = FS{}
 )
 
+// An FS is a [wfs.FS] backed by the local filesystem.
 type FS struct{}
 
 func (FS) Open(name string) (fs.File, error) {
