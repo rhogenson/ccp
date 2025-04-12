@@ -260,7 +260,7 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 				stat, err := d.Info()
 				if err != nil {
 					progress.FileDone(src.String(), err)
-					return nil
+					return fs.SkipDir
 				}
 				hasWritePerm := stat.Mode()&0300 == 0300
 				if err := c.openWithRetry(dst, func() error {
@@ -280,7 +280,7 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 					}
 				}); err != nil {
 					progress.FileDone(src.String(), err)
-					return nil
+					return fs.SkipDir
 				}
 				if hasWritePerm {
 					progress.Progress(1)
