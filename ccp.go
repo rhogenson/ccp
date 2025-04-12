@@ -304,6 +304,7 @@ host with optional path in the form [user@]host:[path]. Local file names
 can be made explicit using absolute or relative pathnames to avoid ccp
 treating file names containing `+"`"+`:' as host specifiers.
 
+Options:
 `)
 		flag.PrintDefaults()
 	}
