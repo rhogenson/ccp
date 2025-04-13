@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"os"
 
-	"gitlab.com/rhogenson/ccp/internal/wfs"
+	"github.com/rhogenson/ccp/internal/wfs"
 )
 
 var (

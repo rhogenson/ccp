@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	"github.com/pkg/sftp"
-	"gitlab.com/rhogenson/ccp/internal/wfs"
+	"github.com/rhogenson/ccp/internal/wfs"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"

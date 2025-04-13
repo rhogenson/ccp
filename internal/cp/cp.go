@@ -11,8 +11,8 @@ import (
 	"slices"
 	"strings"
 
-	"gitlab.com/rhogenson/ccp/internal/wfs"
-	"gitlab.com/rhogenson/ccp/internal/wfs/sftpfs"
+	"github.com/rhogenson/ccp/internal/wfs"
+	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
 )
 
 // Progress is used to asynchronously report status updates and errors to the

@@ -41,10 +41,10 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"gitlab.com/rhogenson/ccp/internal/cp"
-	"gitlab.com/rhogenson/ccp/internal/wfs/osfs"
-	"gitlab.com/rhogenson/ccp/internal/wfs/sftpfs"
-	"gitlab.com/rhogenson/deque"
+	"github.com/rhogenson/container/deque"
+	"github.com/rhogenson/ccp/internal/cp"
+	"github.com/rhogenson/ccp/internal/wfs/osfs"
+	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
 )
 
 var f = flag.Bool("f", false, "if an existing destination file cannot be opened, remove it and try again")
