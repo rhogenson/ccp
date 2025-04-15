@@ -201,12 +201,9 @@ func (c *copier) copySymlink(src FSPath, dst FSPath) error {
 // interface. If force is specified and an existing destination file cannot be
 // opened, Copy will remove it and try again.
 func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
 		progress.Max(size(srcs))
 	}()
-	defer func() { <-done }()
 
 	dstIsDir := true
 	if len(srcs) == 1 {
