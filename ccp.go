@@ -35,7 +35,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -59,22 +59,28 @@ type model struct {
 
 	// max is the total bytes (plus fudge factor) to copy.
 	max int64
-	// current holds the current number of copied bytes.
-	current atomic.Int64
-	// Every 500 milliseconds, the current progress is appended to
-	// measurements for calculating ETA.
-	measurements deque.Deque[measurement]
-	// copyingFile is a file that is or was being copied that we're
-	// currently showing to the user.
-	copyingFile string
-	// eta is the estimated time to completion, or -1 if we don't have
-	// enough samples.
-	eta time.Duration
-	// errs are the errors encountered during operation.
-	errs []string
 	// done indicates whether the copy is done and we're just waiting for
 	// the progress bar to finish animating.
 	done bool
+	// errs are the errors encountered during operation.
+	errs []string
+
+	// Only current and copyingFile are protected by the mutex
+	// (for performance). The other fields are modified in Update according
+	// to the Elm architecture.
+	mu sync.Mutex
+	// current holds the current number of copied bytes.
+	current int64
+	// copyingFile is a file that is or was being copied that we're
+	// currently showing to the user.
+	copyingFile string
+
+	// Every 500 milliseconds, the current progress is appended to
+	// measurements for calculating ETA.
+	measurements deque.Deque[measurement]
+	// eta is the estimated time to completion, or -1 if we don't have
+	// enough samples.
+	eta time.Duration
 }
 
 type (
@@ -85,12 +91,8 @@ type (
 	// during the program lifetime after we asynchronously calculate the
 	// number of bytes to copy.
 	maxMsg int64
-	// fileStartMsg is sent whenever we start copying a file.
-	fileStartMsg struct {
-		from, to string
-	}
-	// fileDoneMsg is sent whenever we finish copying a file. err indicates
-	// any error that was encountered during the copy.
+	// errorMsg is sent whenever we finish copying a file. err indicates any
+	// error that was encountered during the copy.
 	errorMsg struct{ error }
 	// doneMsg is sent when all files are finished copying and it's time
 	// to exit.
@@ -109,15 +111,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case maxMsg:
 		m.max = int64(msg)
-	case fileStartMsg:
-		m.copyingFile = msg.from + " -> " + msg.to
 	case errorMsg:
 		m.errs = append(m.errs, msg.Error())
 	case doneMsg:
 		m.done = true
 		var cmd tea.Cmd
 		if m.max > 0 {
-			cmd = m.progress.SetPercent(float64(m.current.Load()) / float64(m.max))
+			m.mu.Lock()
+			current := m.current
+			m.mu.Unlock()
+			cmd = m.progress.SetPercent(float64(current) / float64(m.max))
 		}
 		if !m.progress.IsAnimating() {
 			return m, tea.Quit
@@ -125,7 +128,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case tickMsg:
-		n := m.current.Load()
+		m.mu.Lock()
+		n := m.current
+		m.mu.Unlock()
 		now := time.Time(msg)
 
 		if m.measurements.Len() == 0 || now.Sub(m.measurements.At(m.measurements.Len()-1).t) > 500*time.Millisecond {
@@ -170,8 +175,11 @@ func (m *model) View() string {
 	if m.eta >= 0 {
 		etaStr = m.eta.Round(time.Second).String()
 	}
+	m.mu.Lock()
+	copyingFile := m.copyingFile
+	m.mu.Unlock()
 	return "\n" +
-		"  " + m.copyingFile + "\n" +
+		"  " + copyingFile + "\n" +
 		"  " + m.progress.View() + "\n" +
 		"  " + "ETA: " + etaStr + "\n\n" +
 		warningStyle(strings.Join(m.errs, "\n")) + "\n"
@@ -179,8 +187,8 @@ func (m *model) View() string {
 
 // progressUpdater implements the cp.Progress interface.
 type progressUpdater struct {
-	p       *tea.Program
-	current *atomic.Int64
+	p *tea.Program
+	m *model
 }
 
 func (pu *progressUpdater) Max(n int64) {
@@ -188,11 +196,16 @@ func (pu *progressUpdater) Max(n int64) {
 }
 
 func (pu *progressUpdater) Progress(n int64) {
-	pu.current.Add(n)
+	pu.m.mu.Lock()
+	defer pu.m.mu.Unlock()
+	pu.m.current += n
 }
 
 func (pu *progressUpdater) FileStart(from, to string) {
-	pu.p.Send(fileStartMsg{from, to})
+	s := from + " -> " + to
+	pu.m.mu.Lock()
+	defer pu.m.mu.Unlock()
+	pu.m.copyingFile = s
 }
 
 func (pu *progressUpdater) Error(err error) {
@@ -251,7 +264,7 @@ func run() error {
 	}
 	p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr))
 	go func() {
-		cp.Copy(&progressUpdater{p, &m.current}, srcs, dst, *f) // Where the magic happens
+		cp.Copy(&progressUpdater{p, m}, srcs, dst, *f) // Where the magic happens
 		p.Send(doneMsg{})
 	}()
 	if _, err := p.Run(); err != nil {
