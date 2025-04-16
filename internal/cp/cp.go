@@ -10,6 +10,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rhogenson/ccp/internal/wfs"
 	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
@@ -24,11 +25,11 @@ type Progress interface {
 	// Progress reports that n additional bytes have been copied.
 	Progress(n int64)
 	// FileStart reports that src is currently being copied to dst. Only
-	// called for regular files, not directories or symlinks.
+	// called for regular files, not directories or symlinks. cp also
+	// rate-limits calls to FileStart, so not all files will be reported.
 	FileStart(src, dst string)
-	// FileDone is called when a regular file has finished copying
-	// successfully, or when there was an error copying a file.
-	FileDone(src string, err error)
+	// Error reports an error encountered.
+	Error(error)
 }
 
 // An FSPath is an abstraction over a file path that can point to multiple
@@ -126,8 +127,9 @@ func (p FSPath) exists() bool {
 }
 
 type copier struct {
-	p     Progress
-	force bool
+	p                  Progress
+	force              bool
+	fileStartRateLimit *time.Ticker
 }
 
 func (c *copier) openWithRetry(path FSPath, fn func() error) error {
@@ -141,7 +143,11 @@ func (c *copier) openWithRetry(path FSPath, fn func() error) error {
 }
 
 func (c *copier) copyRegularFile(src, dst FSPath) error {
-	c.p.FileStart(src.String(), dst.String())
+	select {
+	case <-c.fileStartRateLimit.C:
+		c.p.FileStart(src.String(), dst.String())
+	default:
+	}
 
 	in, err := src.open()
 	if err != nil {
@@ -179,7 +185,6 @@ func (c *copier) copyRegularFile(src, dst FSPath) error {
 		return err
 	}
 	c.p.Progress(1)
-	c.p.FileDone(src.String(), nil)
 	return nil
 }
 
@@ -211,13 +216,15 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 		dstIsDir = err == nil && stat.IsDir()
 	}
 
-	const maxConcurrency = 10
+	const maxConcurrency = 500
 	// sem acts as a semaphore to limit the number of concurrent file copies
 	sem := make(chan struct{}, maxConcurrency)
 	c := &copier{
-		p:     progress,
-		force: force,
+		p:                  progress,
+		force:              force,
+		fileStartRateLimit: time.NewTicker(500 * time.Millisecond),
 	}
+	defer c.fileStartRateLimit.Stop()
 	type roDir struct {
 		path FSPath
 		mode fs.FileMode
@@ -233,14 +240,14 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 		}
 		srcRoot.Path = path.Clean(srcRoot.Path)
 		if srcRoot == dstRoot {
-			progress.FileDone(srcRoot.String(), fmt.Errorf("%q and %q are the same file", srcRoot, dstRoot))
+			progress.Error(fmt.Errorf("%q and %q are the same file", srcRoot, dstRoot))
 			continue
 		}
 		srcRoot.walkDir(func(srcPath string, d fs.DirEntry, err error) error {
 			src := FSPath{srcRoot.FS, srcPath}
 			dst := FSPath{dstRoot.FS, path.Join(dstRoot.Path, strings.TrimPrefix(srcPath, srcRoot.Path))}
 			if err != nil {
-				progress.FileDone(src.String(), err)
+				progress.Error(err)
 				return nil
 			}
 			switch d.Type() {
@@ -249,14 +256,14 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 				go func() {
 					defer func() { <-sem }()
 					if err := c.copyRegularFile(src, dst); err != nil {
-						progress.FileDone(src.String(), err)
+						progress.Error(err)
 					}
 				}()
 
 			case fs.ModeDir:
 				stat, err := d.Info()
 				if err != nil {
-					progress.FileDone(src.String(), err)
+					progress.Error(err)
 					return fs.SkipDir
 				}
 				hasWritePerm := stat.Mode()&0300 == 0300
@@ -276,7 +283,7 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 						return dst.mkdir()
 					}
 				}); err != nil {
-					progress.FileDone(src.String(), err)
+					progress.Error(err)
 					return fs.SkipDir
 				}
 				if hasWritePerm {
@@ -286,10 +293,10 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 				}
 			case fs.ModeSymlink:
 				if err := c.copySymlink(src, dst); err != nil {
-					progress.FileDone(src.String(), err)
+					progress.Error(err)
 				}
 			default:
-				progress.FileDone(src.String(), fmt.Errorf("%s: unknown file type %s", src, d.Type()))
+				progress.Error(fmt.Errorf("%s: unknown file type %s", src, d.Type()))
 			}
 			return nil
 		})
@@ -302,7 +309,7 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 	// parent directory itself.
 	for _, d := range slices.Backward(roDirs) {
 		if err := d.path.chmod(d.mode); err != nil {
-			progress.FileDone(d.path.String(), err)
+			progress.Error(err)
 			continue
 		}
 		progress.Progress(1)

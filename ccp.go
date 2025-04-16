@@ -41,10 +41,10 @@ import (
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/rhogenson/container/deque"
 	"github.com/rhogenson/ccp/internal/cp"
 	"github.com/rhogenson/ccp/internal/wfs/osfs"
 	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
+	"github.com/rhogenson/container/deque"
 )
 
 var f = flag.Bool("f", false, "if an existing destination file cannot be opened, remove it and try again")
@@ -64,12 +64,8 @@ type model struct {
 	// Every 500 milliseconds, the current progress is appended to
 	// measurements for calculating ETA.
 	measurements deque.Deque[measurement]
-	// copyingFiles holds the files currently being copied. Keys are source
-	// paths and values are the corresponding destination paths.
-	copyingFiles map[string]string
-	// copyingFile is an arbitrary entry from copyingFiles that we're
-	// currently showing to the user. Tracked in the state so that it
-	// doesn't change every time we update the view.
+	// copyingFile is a file that is or was being copied that we're
+	// currently showing to the user.
 	copyingFile string
 	// eta is the estimated time to completion, or -1 if we don't have
 	// enough samples.
@@ -95,10 +91,7 @@ type (
 	}
 	// fileDoneMsg is sent whenever we finish copying a file. err indicates
 	// any error that was encountered during the copy.
-	fileDoneMsg struct {
-		name string
-		err  error
-	}
+	errorMsg struct{ error }
 	// doneMsg is sent when all files are finished copying and it's time
 	// to exit.
 	doneMsg struct{}
@@ -117,22 +110,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case maxMsg:
 		m.max = int64(msg)
 	case fileStartMsg:
-		m.copyingFiles[msg.from] = msg.to
-		if m.copyingFile == "" {
-			m.copyingFile = msg.from
-		}
-	case fileDoneMsg:
-		delete(m.copyingFiles, msg.name)
-		if m.copyingFile == msg.name {
-			m.copyingFile = ""
-			for name := range m.copyingFiles {
-				m.copyingFile = name
-				break
-			}
-		}
-		if msg.err != nil {
-			m.errs = append(m.errs, msg.err.Error())
-		}
+		m.copyingFile = msg.from + " -> " + msg.to
+	case errorMsg:
+		m.errs = append(m.errs, msg.Error())
 	case doneMsg:
 		m.done = true
 		var cmd tea.Cmd
@@ -186,16 +166,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 var warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
 
 func (m *model) View() string {
-	copying := ""
-	if m.copyingFile != "" {
-		copying = m.copyingFile + " -> " + m.copyingFiles[m.copyingFile]
-	}
 	etaStr := "calculating..."
 	if m.eta >= 0 {
 		etaStr = m.eta.Round(time.Second).String()
 	}
 	return "\n" +
-		"  " + copying + "\n" +
+		"  " + m.copyingFile + "\n" +
 		"  " + m.progress.View() + "\n" +
 		"  " + "ETA: " + etaStr + "\n\n" +
 		warningStyle(strings.Join(m.errs, "\n")) + "\n"
@@ -219,8 +195,8 @@ func (pu *progressUpdater) FileStart(from, to string) {
 	pu.p.Send(fileStartMsg{from, to})
 }
 
-func (pu *progressUpdater) FileDone(name string, err error) {
-	pu.p.Send(fileDoneMsg{name, err})
+func (pu *progressUpdater) Error(err error) {
+	pu.p.Send(errorMsg{err})
 }
 
 // splitHostPath splits an scp target into host and path, e.g. user@host:/path/
@@ -270,9 +246,8 @@ func run() error {
 	}
 	dst := toFSPath(dstTarget, sftpHosts)
 	m := &model{
-		progress:     progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
-		copyingFiles: make(map[string]string),
-		eta:          -1,
+		progress: progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
+		eta:      -1,
 	}
 	p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr))
 	go func() {
