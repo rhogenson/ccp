@@ -44,7 +44,7 @@ import (
 	"github.com/rhogenson/ccp/internal/cp"
 	"github.com/rhogenson/ccp/internal/wfs/osfs"
 	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
-	"github.com/rhogenson/container/deque"
+	"github.com/rhogenson/deque"
 )
 
 var f = flag.Bool("f", false, "if an existing destination file cannot be opened, remove it and try again")
