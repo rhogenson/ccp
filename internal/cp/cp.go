@@ -216,7 +216,7 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 		dstIsDir = err == nil && stat.IsDir()
 	}
 
-	const maxConcurrency = 500
+	const maxConcurrency = 10
 	// sem acts as a semaphore to limit the number of concurrent file copies
 	sem := make(chan struct{}, maxConcurrency)
 	c := &copier{
