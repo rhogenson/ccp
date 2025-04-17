@@ -1,32 +1,5 @@
 // The ccp ("cute copy") command copies files and directories while showing a
 // colorful progress bar. It supports SFTP remote file copies similar to scp.
-//
-// The architecture is a mix of classical goroutines and the bubbletea-style
-// "Elm architecture". Trying to do a recursive concurrent file copy using the
-// Elm architecture would make Update a massive bottleneck, so that part is
-// performed in a background goroutine that periodically sends updates to the
-// main program using the [cp.Progress] interface.
-//
-// The Elm architecture doesn't seem to fit well with Go's concurrency model in
-// my opinion. You even have articles like
-// https://charm.sh/blog/commands-in-bubbletea/ saying that you should "never"
-// use goroutines in a Bubble Tea program, which IMO is just absurd and throwing
-// out one of the best parts of Go. Ideally a UI library would leverage the
-// strengths of Go's concurrency model instead of trying to force some
-// architecture from a different language. For example, [tea.Tick] is
-// inconvenient because the user has to remember to call Tick again inside
-// Update, otherwise it only runs once. Instead it could have just leveraged the
-// standard library [time.Ticker] with
-//
-//	go func() {
-//	    for t := range time.NewTicker(time.Second).C {
-//	        program.Send(tickMsg(t))
-//	    }
-//	}()
-//
-// It's too limiting that a [tea.Cmd] can only return a single [tea.Msg].
-// Instead, in the true spirit of Go's CSP model, a tea.Cmd should be able to
-// send multiple messages on a channel. Thanks for reading my rant.
 package main
 
 import (
@@ -39,177 +12,56 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/rhogenson/ccp/internal/cp"
+	"github.com/rhogenson/ccp/internal/render"
 	"github.com/rhogenson/ccp/internal/wfs/osfs"
 	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
 	"github.com/rhogenson/deque"
+	"golang.org/x/term"
 )
 
 var f = flag.Bool("f", false, "if an existing destination file cannot be opened, remove it and try again")
+
+var warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
 
 type measurement struct {
 	t time.Time
 	i int64
 }
 
-type model struct {
-	progress progress.Model
-
-	// max is the total bytes (plus fudge factor) to copy.
-	max int64
-	// done indicates whether the copy is done and we're just waiting for
-	// the progress bar to finish animating.
-	done bool
-	// errs are the errors encountered during operation.
-	errs []string
-
-	// Only current and copyingFile are protected by the mutex
-	// (for performance). The other fields are modified in Update according
-	// to the Elm architecture.
-	mu sync.Mutex
-	// current holds the current number of copied bytes.
-	current int64
-	// copyingFile is a file that is or was being copied that we're
-	// currently showing to the user.
-	copyingFile string
-
-	// Every 500 milliseconds, the current progress is appended to
-	// measurements for calculating ETA.
-	measurements deque.Deque[measurement]
-	// eta is the estimated time to completion, or -1 if we don't have
-	// enough samples.
-	eta time.Duration
-}
-
-type (
-	// tickMsg is sent every 500 milliseconds.
-	tickMsg time.Time
-
-	// maxMsg sets the total bytes to copy. This message is only sent once
-	// during the program lifetime after we asynchronously calculate the
-	// number of bytes to copy.
-	maxMsg int64
-	// errorMsg is sent whenever we finish copying a file. err indicates any
-	// error that was encountered during the copy.
-	errorMsg struct{ error }
-	// doneMsg is sent when all files are finished copying and it's time
-	// to exit.
-	doneMsg struct{}
-)
-
-func tick() tea.Cmd {
-	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
-}
-
-func (m *model) Init() tea.Cmd {
-	return tick()
-}
-
-func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case maxMsg:
-		m.max = int64(msg)
-	case errorMsg:
-		m.errs = append(m.errs, msg.Error())
-	case doneMsg:
-		m.done = true
-		var cmd tea.Cmd
-		if m.max > 0 {
-			m.mu.Lock()
-			current := m.current
-			m.mu.Unlock()
-			cmd = m.progress.SetPercent(float64(current) / float64(m.max))
-		}
-		if !m.progress.IsAnimating() {
-			return m, tea.Quit
-		}
-		return m, cmd
-
-	case tickMsg:
-		m.mu.Lock()
-		n := m.current
-		m.mu.Unlock()
-		now := time.Time(msg)
-
-		if m.measurements.Len() == 0 || now.Sub(m.measurements.At(m.measurements.Len()-1).t) > 500*time.Millisecond {
-			for m.measurements.Len() > 1 && now.Sub(m.measurements.At(0).t) > 2*time.Minute {
-				m.measurements.PopFront()
-			}
-			m.measurements.PushBack(measurement{now, n})
-
-			if m.max > 0 {
-				first := m.measurements.At(0)
-				if delta := n - first.i; delta != 0 {
-					deltaT := now.Sub(first.t)
-					m.eta = time.Duration(float64(m.max-n) / float64(delta) * float64(deltaT))
-				}
-			}
-		}
-
-		cmds := []tea.Cmd{tick()}
-		if m.max > 0 {
-			cmds = append(cmds, m.progress.SetPercent(float64(n)/float64(m.max)))
-		}
-		return m, tea.Batch(cmds...)
-
-	// FrameMsg is sent when the progress bar wants to animate itself
-	case progress.FrameMsg:
-		progressModel, cmd := m.progress.Update(msg)
-		m.progress = progressModel.(progress.Model)
-		if m.done && !m.progress.IsAnimating() {
-			return m, tea.Quit
-		}
-		return m, cmd
-	case tea.WindowSizeMsg:
-		m.progress.Width = msg.Width - 4
-	}
-	return m, nil
-}
-
-var warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
-
-func (m *model) View() string {
-	etaStr := "calculating..."
-	if m.eta >= 0 {
-		etaStr = m.eta.Round(time.Second).String()
-	}
-	m.mu.Lock()
-	copyingFile := m.copyingFile
-	m.mu.Unlock()
-	return "\n" +
-		"  " + copyingFile + "\n" +
-		"  " + m.progress.View() + "\n" +
-		"  " + "ETA: " + etaStr + "\n\n" +
-		warningStyle(strings.Join(m.errs, "\n")) + "\n"
-}
-
 // progressUpdater implements the cp.Progress interface.
 type progressUpdater struct {
-	p *tea.Program
-	m *model
+	mu          sync.Mutex
+	max         int64   // Total bytes to copy
+	current     int64   // Current bytes copied
+	copyingFile string  // File currently being copied
+	errs        []error // Any errors encountered
 }
 
 func (pu *progressUpdater) Max(n int64) {
-	pu.p.Send(maxMsg(n))
+	pu.mu.Lock()
+	defer pu.mu.Unlock()
+	pu.max = n
 }
 
 func (pu *progressUpdater) Progress(n int64) {
-	pu.m.mu.Lock()
-	defer pu.m.mu.Unlock()
-	pu.m.current += n
+	pu.mu.Lock()
+	defer pu.mu.Unlock()
+	pu.current += n
 }
 
 func (pu *progressUpdater) FileStart(from, to string) {
 	s := from + " -> " + to
-	pu.m.mu.Lock()
-	defer pu.m.mu.Unlock()
-	pu.m.copyingFile = s
+	pu.mu.Lock()
+	defer pu.mu.Unlock()
+	pu.copyingFile = s
 }
 
 func (pu *progressUpdater) Error(err error) {
-	pu.p.Send(errorMsg{err})
+	pu.mu.Lock()
+	defer pu.mu.Unlock()
+	pu.errs = append(pu.errs, err)
 }
 
 // splitHostPath splits an scp target into host and path, e.g. user@host:/path/
@@ -258,19 +110,87 @@ func run() error {
 		srcs[i] = toFSPath(tgt, sftpHosts)
 	}
 	dst := toFSPath(dstTarget, sftpHosts)
-	m := &model{
-		progress: progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
-		eta:      -1,
-	}
-	p := tea.NewProgram(m, tea.WithInput(nil), tea.WithOutput(os.Stderr))
+
+	bar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
+	doneCh := make(chan struct{})
+	measurements := new(deque.Deque[measurement])
+	eta := time.Duration(-1)
+
+	currentProgress := new(progressUpdater)
 	go func() {
-		cp.Copy(&progressUpdater{p, m}, srcs, dst, *f) // Where the magic happens
-		p.Send(doneMsg{})
+		defer close(doneCh)
+		cp.Copy(currentProgress, srcs, dst, *f) // Where the magic happens
 	}()
-	if _, err := p.Run(); err != nil {
-		return err
+
+	frameTimer := time.NewTicker(time.Second / 30)
+	defer frameTimer.Stop()
+	etaTimer := time.NewTicker(500 * time.Millisecond)
+	defer etaTimer.Stop()
+	done := false
+	renderer := render.New()
+	for !done {
+		select {
+		case now := <-etaTimer.C:
+			currentProgress.mu.Lock()
+			current := currentProgress.current
+			max := currentProgress.max
+			currentProgress.mu.Unlock()
+
+			for measurements.Len() > 1 && now.Sub(measurements.At(0).t) > 2*time.Minute {
+				measurements.PopFront()
+			}
+			measurements.PushBack(measurement{now, current})
+
+			if max > 0 {
+				first := measurements.At(0)
+				if delta := current - first.i; delta != 0 {
+					deltaT := now.Sub(first.t)
+					eta = time.Duration(float64(max-current) / float64(delta) * float64(deltaT))
+				}
+			}
+			continue
+		case <-doneCh:
+			done = true
+		case <-frameTimer.C:
+		}
+
+		width, _, err := term.GetSize(int(os.Stdout.Fd()))
+		if err != nil {
+			width = 80
+		}
+		bar.Width = width - 4
+
+		currentProgress.mu.Lock()
+		current := currentProgress.current
+		max := currentProgress.max
+		copyingFile := currentProgress.copyingFile
+		errs := currentProgress.errs
+		currentProgress.mu.Unlock()
+
+		renderer.Clear()
+		progress := 0.
+		if max > 0 {
+			progress = float64(current) / float64(max)
+		}
+		etaStr := "calculating..."
+		if eta >= 0 {
+			etaStr = eta.Round(time.Second).String()
+		}
+		fmt.Fprintf(renderer, `
+  %s
+  %s
+  ETA: %s
+
+`,
+			copyingFile,
+			bar.ViewAs(progress),
+			etaStr)
+		for _, e := range errs {
+			fmt.Fprintln(renderer, warningStyle(e.Error()))
+		}
+		renderer.Flush()
 	}
-	if len(m.errs) > 0 {
+	if len(currentProgress.errs) > 0 {
 		return errors.New("exiting with one or more errors")
 	}
 	return nil

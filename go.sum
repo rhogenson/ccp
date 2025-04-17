@@ -44,6 +44,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rhogenson/deque v1.0.1 h1:YWzJiImHBaITBHjQ6eXzc6v1oCTvk9r9vrHqjxB4aOk=
 github.com/rhogenson/deque v1.0.1/go.mod h1:3JVW0+HcBcOClQtYlHhsyE5Q5cr/qG1jLEeC46prdtQ=
+github.com/rhogenson/deque v1.1.0 h1:3poepkqJjq3jp+s3eqQ/WTAtiX1hXOmpp+h8l2+PwFI=
+github.com/rhogenson/deque v1.1.0/go.mod h1:3JVW0+HcBcOClQtYlHhsyE5Q5cr/qG1jLEeC46prdtQ=
 github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
 github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=

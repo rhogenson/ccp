@@ -10,7 +10,6 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/rhogenson/ccp/internal/wfs"
 	"github.com/rhogenson/ccp/internal/wfs/sftpfs"
@@ -127,9 +126,8 @@ func (p FSPath) exists() bool {
 }
 
 type copier struct {
-	p                  Progress
-	force              bool
-	fileStartRateLimit *time.Ticker
+	p     Progress
+	force bool
 }
 
 func (c *copier) openWithRetry(path FSPath, fn func() error) error {
@@ -143,11 +141,7 @@ func (c *copier) openWithRetry(path FSPath, fn func() error) error {
 }
 
 func (c *copier) copyRegularFile(src, dst FSPath) error {
-	select {
-	case <-c.fileStartRateLimit.C:
-		c.p.FileStart(src.String(), dst.String())
-	default:
-	}
+	c.p.FileStart(src.String(), dst.String())
 
 	in, err := src.open()
 	if err != nil {
@@ -220,11 +214,9 @@ func Copy(progress Progress, srcs []FSPath, dstRoot FSPath, force bool) {
 	// sem acts as a semaphore to limit the number of concurrent file copies
 	sem := make(chan struct{}, maxConcurrency)
 	c := &copier{
-		p:                  progress,
-		force:              force,
-		fileStartRateLimit: time.NewTicker(500 * time.Millisecond),
+		p:     progress,
+		force: force,
 	}
-	defer c.fileStartRateLimit.Stop()
 	type roDir struct {
 		path FSPath
 		mode fs.FileMode
