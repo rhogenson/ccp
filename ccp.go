@@ -7,9 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
@@ -33,9 +35,10 @@ type measurement struct {
 // progressUpdater implements the cp.Progress interface.
 type progressUpdater struct {
 	mu          sync.Mutex
-	max         int64   // Total bytes to copy
-	current     int64   // Current bytes copied
-	copyingFile string  // File currently being copied
+	max         int64  // Total bytes to copy
+	current     int64  // Current bytes copied
+	copyingFrom string // File currently being copied
+	copyingTo   string
 	errs        []error // Any errors encountered
 }
 
@@ -51,11 +54,21 @@ func (pu *progressUpdater) Progress(n int64) {
 	pu.current += n
 }
 
+func abbreviatePath(p string) string {
+	parts := strings.Split(p, string(filepath.Separator))
+	for i := 1; i < len(parts)-1; i++ {
+		part := parts[i]
+		_, n := utf8.DecodeRuneInString(part)
+		parts[i] = part[:n]
+	}
+	return strings.Join(parts, string(filepath.Separator))
+}
+
 func (pu *progressUpdater) FileStart(from, to string) {
-	s := from + " -> " + to
 	pu.mu.Lock()
 	defer pu.mu.Unlock()
-	pu.copyingFile = s
+	pu.copyingFrom = from
+	pu.copyingTo = to
 }
 
 func (pu *progressUpdater) Error(err error) {
@@ -163,16 +176,27 @@ func run() error {
 		currentProgress.mu.Lock()
 		current := currentProgress.current
 		max := currentProgress.max
-		copyingFile := currentProgress.copyingFile
+		copyingFrom := currentProgress.copyingFrom
+		copyingTo := currentProgress.copyingTo
 		errs := currentProgress.errs
 		currentProgress.mu.Unlock()
 
-		renderer.Clear()
+		renderer.Clear(width)
+		copyingFile := ""
+		if copyingFrom != "" {
+			copyingFile = copyingFrom + " -> " + copyingTo
+			if len(copyingFile)+4 > width {
+				copyingFile = copyingFrom + " -> " + abbreviatePath(copyingTo)
+				if len(copyingFile)+4 > width {
+					copyingFile = abbreviatePath(copyingFrom) + " -> " + abbreviatePath(copyingTo)
+				}
+			}
+		}
 		progress := 0.
 		if max > 0 {
 			progress = float64(current) / float64(max)
 		}
-		etaStr := "calculating..."
+		etaStr := "..."
 		if eta >= 0 {
 			etaStr = eta.Round(time.Second).String()
 		}

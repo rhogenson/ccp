@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"unicode/utf8"
 )
 
 // Renderer updates a terminal UI. Typical usage looks like
@@ -20,8 +21,10 @@ import (
 //	    r.Flush()
 //	}
 type Renderer struct {
-	w         bufio.Writer
-	prevLines int
+	w              bufio.Writer
+	prevLines      int
+	width          int
+	partialLineLen int
 }
 
 // New creates a new Renderer
@@ -32,12 +35,38 @@ func New() *Renderer {
 }
 
 // Clear clears the screen before rendering a new frame.
-func (r *Renderer) Clear() {
+func (r *Renderer) Clear(width int) {
+	r.width = width
 	if r.prevLines > 0 {
 		fmt.Fprintf(&r.w, "\033[%dA", r.prevLines)
 	}
-	r.prevLines = 0
 	r.w.WriteString("\r")
+	r.prevLines = 0
+	r.partialLineLen = 0
+}
+
+func truncate(b []byte, width int) ([]byte, int) {
+	n := 0
+	for i := 0; i < len(b); {
+		if bytes.HasPrefix(b[i:], []byte("\033[")) {
+			// An escape sequence usually starts with [, then has one or two numbers
+			// separated by semicolon, and ends with some terminating character. To
+			// try and munch the whole sequence, skip over any numbers and
+			// semicolon here.
+			for i += 2; i < len(b)-1 && ('0' <= b[i] && b[i] <= '9' || b[i] == ';'); i++ {
+			}
+			// Skip the terminating character.
+			i++
+			continue
+		}
+		if n+1 > width {
+			return b[:i], n
+		}
+		_, runeWidth := utf8.DecodeRune(b[i:])
+		i += runeWidth
+		n++
+	}
+	return b, n
 }
 
 // Write implements io.Writer.
@@ -46,22 +75,26 @@ func (r *Renderer) Write(buf []byte) (int, error) {
 	for len(buf) > 0 {
 		i := bytes.IndexByte(buf, '\n')
 		if i < 0 {
-			n, err := r.w.Write(buf)
-			totalBytes += n
-			return totalBytes, err
+			line, lineWidth := truncate(buf, r.width-r.partialLineLen)
+			r.partialLineLen += lineWidth
+			if n, err := r.w.Write(line); err != nil {
+				return totalBytes + n, err
+			}
+			totalBytes += len(buf)
+			return totalBytes, nil
 		}
-		line := buf[:i]
+		line, _ := truncate(buf[:i], r.width)
 		buf = buf[i+1:]
-		n, err := r.w.Write(line)
-		totalBytes += n
-		if err != nil {
-			return totalBytes, err
+		if n, err := r.w.Write(line); err != nil {
+			return totalBytes + n, err
 		}
+		totalBytes += i
 		if _, err := r.w.WriteString("\033[K\n"); err != nil {
 			return totalBytes, err
 		}
 		totalBytes++
 		r.prevLines++
+		r.partialLineLen = 0
 	}
 	return totalBytes, nil
 }
