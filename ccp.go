@@ -167,7 +167,7 @@ func run() error {
 		case <-frameTimer.C:
 		}
 
-		width, _, err := term.GetSize(int(os.Stdout.Fd()))
+		width, height, err := term.GetSize(int(os.Stdout.Fd()))
 		if err != nil {
 			width = 80
 		}
@@ -175,7 +175,7 @@ func run() error {
 
 		currentProgress.mu.Lock()
 		current := currentProgress.current
-		max := currentProgress.max
+		maxBytes := currentProgress.max
 		copyingFrom := currentProgress.copyingFrom
 		copyingTo := currentProgress.copyingTo
 		errs := currentProgress.errs
@@ -193,8 +193,8 @@ func run() error {
 			}
 		}
 		progress := 0.
-		if max > 0 {
-			progress = float64(current) / float64(max)
+		if maxBytes > 0 {
+			progress = float64(current) / float64(maxBytes)
 		}
 		etaStr := "..."
 		if eta >= 0 {
@@ -209,7 +209,7 @@ func run() error {
 			copyingFile,
 			bar.ViewAs(progress),
 			etaStr)
-		for _, e := range errs {
+		for _, e := range errs[max(len(errs)-max(height-5, 0), 0):] {
 			fmt.Fprintln(renderer, warningStyle(e.Error()))
 		}
 		renderer.Flush()
