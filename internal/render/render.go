@@ -6,7 +6,8 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"unicode/utf8"
+
+	runewidth "github.com/mattn/go-runewidth"
 )
 
 // Renderer updates a terminal UI. Typical usage looks like
@@ -46,9 +47,13 @@ func (r *Renderer) Clear(width int) {
 }
 
 func truncate(b []byte, width int) ([]byte, int) {
-	n := 0
+	str := string(b)
+	currentWidth := 0
 	for i := 0; i < len(b); {
-		if bytes.HasPrefix(b[i:], []byte("\033[")) {
+		chunkBytes := bytes.Index(b[i:], []byte("\033["))
+		if chunkBytes < 0 {
+			chunkBytes = len(b) - i
+		} else if chunkBytes == 0 {
 			// An escape sequence usually starts with [, then has one or two numbers
 			// separated by semicolon, and ends with some terminating character. To
 			// try and munch the whole sequence, skip over any numbers and
@@ -59,14 +64,16 @@ func truncate(b []byte, width int) ([]byte, int) {
 			i++
 			continue
 		}
-		if n+1 > width {
-			return b[:i], n
+		chunkWidth := runewidth.StringWidth(str[i : i+chunkBytes])
+		if currentWidth+chunkWidth <= width {
+			i += chunkBytes
+			currentWidth += chunkWidth
+			continue
 		}
-		_, runeWidth := utf8.DecodeRune(b[i:])
-		i += runeWidth
-		n++
+		lastChunk := runewidth.Truncate(str[i:i+chunkBytes], width-currentWidth, "")
+		return b[:i+len(lastChunk)], width
 	}
-	return b, n
+	return b, currentWidth
 }
 
 // Write implements io.Writer.
